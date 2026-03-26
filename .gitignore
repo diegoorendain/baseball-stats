@@ -1,0 +1,24 @@
+# Cached pybaseball data
+cache/*.csv
+
+# Trained XGBoost models
+saved_models/*.json
+
+# Prediction outputs
+output/*.csv
+
+# Keep directory markers
+!cache/.gitkeep
+!saved_models/.gitkeep
+!output/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+.env
