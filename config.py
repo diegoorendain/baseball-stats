@@ -1,69 +1,130 @@
-# Configuration Settings for Baseball Stats
+"""Configuration settings for baseball-stats."""
 
-## Seasons
-SEASONS = ['2021', '2022', '2023', '2024', '2025', '2026']
+import os
 
-## Directories
-CACHE_DIR = './cache/'
-MODELS_DIR = './models/'
-OUTPUT_DIR = './output/'
+# Seasons to use for training data
+SEASONS = [2023, 2024, 2025]
 
-## XGBoost Parameters for Models
+# Directories
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CACHE_DIR = os.path.join(BASE_DIR, "cache")
+MODELS_DIR = os.path.join(BASE_DIR, "saved_models")
+OUTPUT_DIR = os.path.join(BASE_DIR, "output")
+
+# XGBoost hyperparameters per model
 XGBOOST_PARAMS = {
-    'total_runs': {
-        'learning_rate': 0.1,
-        'max_depth': 6,
-        'n_estimators': 100
+    "total_runs": {
+        "objective": "reg:squarederror",
+        "max_depth": 6,
+        "learning_rate": 0.05,
+        "n_estimators": 300,
+        "subsample": 0.8,
+        "colsample_bytree": 0.8,
+        "random_state": 42,
     },
-    'game_winner': {
-        'learning_rate': 0.1,
-        'max_depth': 6,
-        'n_estimators': 100
+    "game_winner": {
+        "objective": "binary:logistic",
+        "max_depth": 5,
+        "learning_rate": 0.05,
+        "n_estimators": 300,
+        "subsample": 0.8,
+        "colsample_bytree": 0.8,
+        "random_state": 42,
     },
-    'home_runs': {
-        'learning_rate': 0.1,
-        'max_depth': 6,
-        'n_estimators': 100
+    "home_runs": {
+        "objective": "count:poisson",
+        "max_depth": 4,
+        "learning_rate": 0.03,
+        "n_estimators": 400,
+        "subsample": 0.8,
+        "colsample_bytree": 0.8,
+        "random_state": 42,
     },
-    'strikeouts': {
-        'learning_rate': 0.1,
-        'max_depth': 6,
-        'n_estimators': 100
+    "strikeouts": {
+        "objective": "reg:squarederror",
+        "max_depth": 5,
+        "learning_rate": 0.05,
+        "n_estimators": 300,
+        "subsample": 0.8,
+        "colsample_bytree": 0.8,
+        "random_state": 42,
     },
-    'hits': {
-        'learning_rate': 0.1,
-        'max_depth': 6,
-        'n_estimators': 100
-    }
+    "hits": {
+        "objective": "count:poisson",
+        "max_depth": 4,
+        "learning_rate": 0.03,
+        "n_estimators": 400,
+        "subsample": 0.8,
+        "colsample_bytree": 0.8,
+        "random_state": 42,
+    },
 }
 
-## Park Factors for MLB Teams
+# Park factors – runs (1.0 = neutral)
 PARK_FACTORS = {
-    'AAR': 1.005,
-    'ATL': 1.013,
-    'BOS': 1.018,
-    'CHC': 1.002,
-    'CIN': 1.017,
-    'CLE': 1.008,
-    'COL': 1.031,
-    'DET': 1.001,
-    'HOU': 1.015,
-    'KCR': 1.011,
-    'LAD': 1.010,
-    'MIA': 1.006,
-    'MIL': 1.012,
-    'MIN': 1.009,
-    'NYY': 1.020,
-    'NYM': 1.014,
-    'OAK': 1.005,
-    'PHI': 1.020,
-    'PIT': 1.007,
-    'SDP': 1.003,
-    'SFG': 1.019,
-    'SEA': 1.016,
-    'STL': 1.018,
-    'TBR': 1.010,
-    'TEX': 1.024,
-    'TOR': 1.022,
-    'WSN': 1.017
+    "ARI": {"runs": 1.010, "hr": 1.020, "hits": 1.008},
+    "ATL": {"runs": 1.013, "hr": 1.015, "hits": 1.010},
+    "BAL": {"runs": 1.005, "hr": 1.010, "hits": 1.003},
+    "BOS": {"runs": 1.018, "hr": 1.012, "hits": 1.020},
+    "CHC": {"runs": 1.002, "hr": 1.005, "hits": 1.000},
+    "CHW": {"runs": 0.998, "hr": 1.008, "hits": 0.997},
+    "CIN": {"runs": 1.017, "hr": 1.025, "hits": 1.012},
+    "CLE": {"runs": 1.008, "hr": 1.000, "hits": 1.005},
+    "COL": {"runs": 1.031, "hr": 1.040, "hits": 1.030},
+    "DET": {"runs": 1.001, "hr": 0.995, "hits": 1.002},
+    "HOU": {"runs": 1.015, "hr": 1.010, "hits": 1.012},
+    "KCR": {"runs": 1.011, "hr": 1.005, "hits": 1.008},
+    "LAA": {"runs": 1.000, "hr": 1.002, "hits": 0.999},
+    "LAD": {"runs": 1.010, "hr": 1.008, "hits": 1.007},
+    "MIA": {"runs": 1.006, "hr": 0.998, "hits": 1.003},
+    "MIL": {"runs": 1.012, "hr": 1.015, "hits": 1.008},
+    "MIN": {"runs": 1.009, "hr": 1.012, "hits": 1.005},
+    "NYM": {"runs": 1.014, "hr": 1.010, "hits": 1.012},
+    "NYY": {"runs": 1.020, "hr": 1.030, "hits": 1.015},
+    "OAK": {"runs": 1.005, "hr": 0.998, "hits": 1.002},
+    "PHI": {"runs": 1.020, "hr": 1.025, "hits": 1.015},
+    "PIT": {"runs": 1.007, "hr": 1.000, "hits": 1.005},
+    "SDP": {"runs": 1.003, "hr": 0.998, "hits": 1.001},
+    "SEA": {"runs": 1.016, "hr": 1.005, "hits": 1.010},
+    "SFG": {"runs": 1.019, "hr": 0.988, "hits": 1.015},
+    "STL": {"runs": 1.018, "hr": 1.010, "hits": 1.015},
+    "TBR": {"runs": 1.010, "hr": 1.005, "hits": 1.008},
+    "TEX": {"runs": 1.024, "hr": 1.030, "hits": 1.018},
+    "TOR": {"runs": 1.022, "hr": 1.018, "hits": 1.015},
+    "WSN": {"runs": 1.017, "hr": 1.020, "hits": 1.010},
+}
+
+# MLB team abbreviation map (statsapi name -> pybaseball abbrev)
+TEAM_ABBREV_MAP = {
+    "Arizona Diamondbacks": "ARI",
+    "Atlanta Braves": "ATL",
+    "Baltimore Orioles": "BAL",
+    "Boston Red Sox": "BOS",
+    "Chicago Cubs": "CHC",
+    "Chicago White Sox": "CHW",
+    "Cincinnati Reds": "CIN",
+    "Cleveland Guardians": "CLE",
+    "Colorado Rockies": "COL",
+    "Detroit Tigers": "DET",
+    "Houston Astros": "HOU",
+    "Kansas City Royals": "KCR",
+    "Los Angeles Angels": "LAA",
+    "Los Angeles Dodgers": "LAD",
+    "Miami Marlins": "MIA",
+    "Milwaukee Brewers": "MIL",
+    "Minnesota Twins": "MIN",
+    "New York Mets": "NYM",
+    "New York Yankees": "NYY",
+    "Oakland Athletics": "OAK",
+    "Philadelphia Phillies": "PHI",
+    "Pittsburgh Pirates": "PIT",
+    "San Diego Padres": "SDP",
+    "San Francisco Giants": "SFG",
+    "Seattle Mariners": "SEA",
+    "St. Louis Cardinals": "STL",
+    "Tampa Bay Rays": "TBR",
+    "Texas Rangers": "TEX",
+    "Toronto Blue Jays": "TOR",
+    "Washington Nationals": "WSN",
+    "Athletics": "OAK",
 }
