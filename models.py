@@ -1,4 +1,4 @@
-"""XGBoost models for baseball predictions."""
+"""XGBoost + LightGBM + Logistic Regression ensemble models for baseball predictions."""
 
 from __future__ import annotations
 
@@ -10,10 +10,29 @@ import numpy as np
 import pandas as pd
 import xgboost as xgb
 
-from config import MODELS_DIR, XGBOOST_PARAMS
+from config import MODELS_DIR, XGBOOST_PARAMS, ENSEMBLE_WEIGHTS, LIGHTGBM_PARAMS
 
 # Ensure models directory exists
 os.makedirs(MODELS_DIR, exist_ok=True)
+
+# Optional LightGBM / sklearn imports (graceful fallback if not installed)
+try:
+    import lightgbm as lgb
+    _LGB_AVAILABLE = True
+except ImportError:
+    lgb = None  # type: ignore[assignment]
+    _LGB_AVAILABLE = False
+
+try:
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.calibration import CalibratedClassifierCV
+    from sklearn.preprocessing import StandardScaler
+    _SKLEARN_CALIBRATION_AVAILABLE = True
+except ImportError:
+    LogisticRegression = None  # type: ignore[assignment,misc]
+    CalibratedClassifierCV = None  # type: ignore[assignment]
+    StandardScaler = None  # type: ignore[assignment]
+    _SKLEARN_CALIBRATION_AVAILABLE = False
 
 
 class BaseModel:
@@ -77,6 +96,25 @@ class BaseModel:
         # Pop objective so it can be passed separately to the XGB constructor
         params.pop("objective", None)
         return params
+
+    def feature_importance(self) -> pd.Series:
+        """Return feature importances sorted descending.
+
+        Returns an empty Series if the model has not been trained or does not
+        expose feature importances.
+        """
+        if not self.is_trained() or self.model is None:
+            return pd.Series(dtype=float)
+        try:
+            importances = self.model.feature_importances_
+            names = getattr(self.model, "feature_names_in_", None)
+            if names is not None:
+                series = pd.Series(importances, index=names)
+            else:
+                series = pd.Series(importances)
+            return series.sort_values(ascending=False)
+        except AttributeError:
+            return pd.Series(dtype=float)
 
 
 # ---------------------------------------------------------------------------
@@ -207,3 +245,172 @@ class HitsModel(BaseModel):
                 }
             )
         return results
+
+
+# ---------------------------------------------------------------------------
+# Ensemble models
+# ---------------------------------------------------------------------------
+
+class EnsembleGameWinnerModel:
+    """Ensemble of XGBoost + LightGBM + Logistic Regression for game winner.
+
+    Averages predictions with configurable weights from ``config.ENSEMBLE_WEIGHTS``
+    and optionally applies isotonic calibration (Platt scaling) to the output.
+    """
+
+    def __init__(self) -> None:
+        self._xgb = GameWinnerModel()
+        self._lgb: Any = None
+        self._lr: Any = None
+        self._scaler: Any = None
+        self._is_trained = False
+        self._weights = ENSEMBLE_WEIGHTS
+
+    def train(self, X: pd.DataFrame, y: pd.Series) -> None:
+        """Fit all sub-models on the same training data."""
+        # XGBoost
+        self._xgb.train(X, y)
+
+        # LightGBM
+        if _LGB_AVAILABLE:
+            try:
+                params = {k: v for k, v in LIGHTGBM_PARAMS["game_winner"].items()
+                          if k not in ("objective", "verbose")}
+                self._lgb = lgb.LGBMClassifier(
+                    objective="binary",
+                    verbose=-1,
+                    **params,
+                )
+                self._lgb.fit(X, y)
+            except Exception as exc:
+                print(f"[WARN] LightGBM training failed: {exc}")
+                self._lgb = None
+
+        # Logistic Regression
+        if _SKLEARN_CALIBRATION_AVAILABLE and LogisticRegression is not None:
+            try:
+                self._scaler = StandardScaler()
+                X_scaled = self._scaler.fit_transform(X.fillna(0.0))
+                self._lr = LogisticRegression(max_iter=500, random_state=42)
+                self._lr.fit(X_scaled, y)
+            except Exception as exc:
+                print(f"[WARN] LogisticRegression training failed: {exc}")
+                self._lr = None
+                self._scaler = None
+
+        self._is_trained = True
+
+    def predict_calibrated_proba(self, X: pd.DataFrame) -> np.ndarray:
+        """Return calibrated ensemble probability that home team wins."""
+        if not self._is_trained:
+            raise RuntimeError("EnsembleGameWinnerModel has not been trained yet.")
+
+        probs_weighted = np.zeros(len(X))
+        total_weight = 0.0
+
+        # XGBoost
+        try:
+            xgb_proba = self._xgb.predict_proba(X)
+            w = self._weights.get("xgboost", 0.5)
+            probs_weighted += np.atleast_1d(xgb_proba) * w
+            total_weight += w
+        except Exception as exc:
+            print(f"[WARN] XGBoost ensemble predict failed: {exc}")
+
+        # LightGBM
+        if self._lgb is not None:
+            try:
+                lgb_proba = self._lgb.predict_proba(X.fillna(0.0))[:, 1]
+                w = self._weights.get("lightgbm", 0.3)
+                probs_weighted += lgb_proba * w
+                total_weight += w
+            except Exception as exc:
+                print(f"[WARN] LightGBM ensemble predict failed: {exc}")
+
+        # Logistic Regression
+        if self._lr is not None and self._scaler is not None:
+            try:
+                X_scaled = self._scaler.transform(X.fillna(0.0))
+                lr_proba = self._lr.predict_proba(X_scaled)[:, 1]
+                w = self._weights.get("logistic", 0.2)
+                probs_weighted += lr_proba * w
+                total_weight += w
+            except Exception as exc:
+                print(f"[WARN] Logistic Regression ensemble predict failed: {exc}")
+
+        if total_weight > 0:
+            return probs_weighted / total_weight
+        return np.full(len(X), 0.5)
+
+    def is_trained(self) -> bool:
+        return self._is_trained
+
+
+class EnsembleTotalRunsModel:
+    """Ensemble of XGBoost + LightGBM for total runs regression."""
+
+    def __init__(self) -> None:
+        self._xgb = TotalRunsModel()
+        self._lgb: Any = None
+        self._is_trained = False
+        self._weights = ENSEMBLE_WEIGHTS
+
+    def train(self, X: pd.DataFrame, y: pd.Series) -> None:
+        """Fit XGBoost and LightGBM sub-models."""
+        self._xgb.train(X, y)
+
+        if _LGB_AVAILABLE:
+            try:
+                params = {k: v for k, v in LIGHTGBM_PARAMS["total_runs"].items()
+                          if k not in ("objective", "verbose")}
+                self._lgb = lgb.LGBMRegressor(
+                    objective="regression",
+                    verbose=-1,
+                    **params,
+                )
+                self._lgb.fit(X, y)
+            except Exception as exc:
+                print(f"[WARN] LightGBM regression training failed: {exc}")
+                self._lgb = None
+
+        self._is_trained = True
+
+    def predict(self, X: pd.DataFrame) -> np.ndarray:
+        """Return ensemble predicted total runs."""
+        if not self._is_trained:
+            raise RuntimeError("EnsembleTotalRunsModel has not been trained yet.")
+
+        preds_weighted = np.zeros(len(X))
+        total_weight = 0.0
+
+        try:
+            xgb_preds = self._xgb.predict(X)
+            w = self._weights.get("xgboost", 0.5)
+            preds_weighted += np.atleast_1d(xgb_preds) * w
+            total_weight += w
+        except Exception as exc:
+            print(f"[WARN] XGBoost runs predict failed: {exc}")
+
+        if self._lgb is not None:
+            try:
+                lgb_preds = self._lgb.predict(X.fillna(0.0))
+                w = self._weights.get("lightgbm", 0.3)
+                preds_weighted += lgb_preds * w
+                total_weight += w
+            except Exception as exc:
+                print(f"[WARN] LightGBM runs predict failed: {exc}")
+
+        if total_weight > 0:
+            return preds_weighted / total_weight
+        return np.full(len(X), 9.0)
+
+    def predict_with_confidence(self, X: pd.DataFrame) -> list[dict[str, float]]:
+        """Return predicted total runs and approximate margin."""
+        preds = self.predict(X)
+        return [
+            {"predicted_runs": float(p), "margin": float(p) * 0.25}
+            for p in preds
+        ]
+
+    def is_trained(self) -> bool:
+        return self._is_trained

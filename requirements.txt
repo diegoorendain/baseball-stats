@@ -1,6 +1,8 @@
 xgboost>=2.0.0
+lightgbm>=4.0.0
 pybaseball>=2.2.7
 pandas>=2.1.0
 numpy>=1.26.0
 scikit-learn>=1.4.0
 MLB-StatsAPI>=1.7.0
+requests>=2.31.0

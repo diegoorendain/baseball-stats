@@ -9,7 +9,7 @@ import pandas as pd
 
 import statsapi
 
-from config import CACHE_DIR, SEASONS, TEAM_ABBREV_MAP
+from config import CACHE_DIR, SEASONS, TEAM_ABBREV_MAP, OPENWEATHER_API_KEY, STADIUM_COORDINATES
 
 # Ensure cache directory exists
 os.makedirs(CACHE_DIR, exist_ok=True)
@@ -657,3 +657,292 @@ def load_all_pitching_stats(seasons: list[int] | None = None) -> pd.DataFrame:
     if not frames:
         return pd.DataFrame()
     return pd.concat(frames, ignore_index=True)
+
+
+# ---------------------------------------------------------------------------
+# Umpire data — via MLB Stats API boxscore
+# ---------------------------------------------------------------------------
+
+_UMPIRE_CACHE: dict[int, dict[str, Any]] = {}
+
+
+def load_umpire_data(game_id: int) -> dict[str, Any]:
+    """Get umpire assignment for *game_id* from statsapi boxscore.
+
+    Returns a dict with ``home_plate_umpire`` (str) and ``game_id`` (int).
+    Results are cached in memory.
+    """
+    if game_id in _UMPIRE_CACHE:
+        return _UMPIRE_CACHE[game_id]
+
+    result: dict[str, Any] = {"game_id": game_id, "home_plate_umpire": ""}
+    try:
+        boxscore = statsapi.boxscore_data(game_id)
+        officials = boxscore.get("officials", []) if isinstance(boxscore, dict) else []
+        for official in officials:
+            if isinstance(official, dict):
+                title = official.get("officialType", "")
+                if "Home Plate" in title or "home plate" in title.lower():
+                    name_info = official.get("official", {})
+                    result["home_plate_umpire"] = name_info.get("fullName", "")
+                    break
+    except Exception as exc:
+        print(f"[WARN] Could not load umpire data for game {game_id}: {exc}")
+
+    _UMPIRE_CACHE[game_id] = result
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Weather data — via OpenWeatherMap free API
+# ---------------------------------------------------------------------------
+
+_WEATHER_CACHE: dict[str, dict[str, Any]] = {}
+
+
+def load_weather_data(team: str, date: str) -> dict[str, Any]:
+    """Get weather forecast/current conditions for *team*'s stadium on *date*.
+
+    Uses OpenWeatherMap free current-weather endpoint.  Requires
+    ``OPENWEATHER_API_KEY`` to be set in the environment (or config.py).
+
+    Parameters
+    ----------
+    team:
+        Team abbreviation (e.g. ``"NYY"``).
+    date:
+        Date string ``YYYY-MM-DD`` (used as cache key; current weather is
+        fetched regardless of date since free tier has no forecast beyond 3h).
+
+    Returns
+    -------
+    Dict with keys: temp_f, wind_speed_mph, wind_direction, humidity,
+    description, is_outdoor (1/0).
+    """
+    from config import INDOOR_STADIUMS
+
+    cache_key = f"{team}_{date}"
+    if cache_key in _WEATHER_CACHE:
+        return _WEATHER_CACHE[cache_key]
+
+    is_outdoor = 0 if team in INDOOR_STADIUMS else 1
+    default: dict[str, Any] = {
+        "temp_f": 70.0,
+        "wind_speed_mph": 5.0,
+        "wind_direction": 0,
+        "humidity": 50,
+        "description": "N/A",
+        "is_outdoor": is_outdoor,
+    }
+
+    if not OPENWEATHER_API_KEY:
+        _WEATHER_CACHE[cache_key] = default
+        return default
+
+    coords = STADIUM_COORDINATES.get(team)
+    if coords is None:
+        _WEATHER_CACHE[cache_key] = default
+        return default
+
+    lat, lon = coords
+    url = (
+        f"https://api.openweathermap.org/data/2.5/weather"
+        f"?lat={lat}&lon={lon}&appid={OPENWEATHER_API_KEY}&units=imperial"
+    )
+    try:
+        import requests
+        resp = requests.get(url, timeout=5)
+        if resp.status_code == 200:
+            data = resp.json()
+            weather = data.get("weather", [{}])[0]
+            main = data.get("main", {})
+            wind = data.get("wind", {})
+            result: dict[str, Any] = {
+                "temp_f": float(main.get("temp", 70.0)),
+                "wind_speed_mph": float(wind.get("speed", 5.0)),
+                "wind_direction": int(wind.get("deg", 0)),
+                "humidity": int(main.get("humidity", 50)),
+                "description": weather.get("description", ""),
+                "is_outdoor": is_outdoor,
+            }
+            _WEATHER_CACHE[cache_key] = result
+            return result
+        else:
+            print(f"[WARN] OpenWeatherMap returned status {resp.status_code} for {team}.")
+    except Exception as exc:
+        print(f"[WARN] Could not load weather data for {team}: {exc}")
+
+    _WEATHER_CACHE[cache_key] = default
+    return default
+
+
+# ---------------------------------------------------------------------------
+# Team schedule context (rest days, travel, bullpen usage)
+# ---------------------------------------------------------------------------
+
+def load_team_schedule_context(
+    team: str,
+    date: str,
+    game_logs: pd.DataFrame,
+) -> dict[str, Any]:
+    """Calculate schedule-based context features for *team* on *date*.
+
+    Parameters
+    ----------
+    team:
+        Team abbreviation.
+    date:
+        Today's date string ``YYYY-MM-DD``.
+    game_logs:
+        DataFrame of this team's recent game log (output of
+        ``load_team_game_logs``).
+
+    Returns
+    -------
+    Dict with: rest_days, games_last_7, travel_flag, is_day_game.
+    """
+    default: dict[str, Any] = {
+        "rest_days": 1,
+        "games_last_7": 5,
+        "travel_flag": 0,
+        "is_day_game": 0,
+    }
+
+    try:
+        if game_logs.empty:
+            return default
+
+        logs = game_logs.copy()
+        logs.columns = [c.lower() for c in logs.columns]
+        if "date" not in logs.columns:
+            return default
+
+        logs["date"] = pd.to_datetime(logs["date"], errors="coerce")
+        logs = logs.dropna(subset=["date"]).sort_values("date")
+
+        target_dt = pd.to_datetime(date, errors="coerce")
+        if pd.isna(target_dt):
+            return default
+
+        past = logs[logs["date"] < target_dt]
+        if past.empty:
+            return default
+
+        last_game_date = past["date"].iloc[-1]
+        rest_days = max(0, (target_dt - last_game_date).days)
+
+        cutoff_7 = target_dt - pd.Timedelta(days=7)
+        games_last_7 = int((past["date"] >= cutoff_7).sum())
+
+        # Travel flag: opponent changed day-over-day (coarse approximation)
+        travel_flag = 0
+        if "opp" in past.columns and len(past) >= 2:
+            last_opp = str(past["opp"].iloc[-1])
+            prev_opp = str(past["opp"].iloc[-2])
+            travel_flag = int(last_opp != prev_opp)
+
+        return {
+            "rest_days": int(rest_days),
+            "games_last_7": int(games_last_7),
+            "travel_flag": travel_flag,
+            "is_day_game": 0,  # day/night requires live game feed
+        }
+    except Exception as exc:
+        print(f"[WARN] Could not compute schedule context for {team}: {exc}")
+        return default
+
+
+# ---------------------------------------------------------------------------
+# Bullpen usage / fatigue
+# ---------------------------------------------------------------------------
+
+def load_bullpen_usage(team: str, date: str, season: int) -> dict[str, Any]:
+    """Estimate bullpen workload from Statcast data for *team* around *date*.
+
+    Parameters
+    ----------
+    team:
+        Team abbreviation.
+    date:
+        Today's date string ``YYYY-MM-DD``.
+    season:
+        MLB season year.
+
+    Returns
+    -------
+    Dict with: bullpen_pitches_last_3d, bullpen_ip_last_3d,
+    bullpen_fatigue_score (0-1, higher = more tired).
+    """
+    default: dict[str, Any] = {
+        "bullpen_pitches_last_3d": 0,
+        "bullpen_ip_last_3d": 0.0,
+        "bullpen_fatigue_score": 0.5,
+    }
+
+    try:
+        sc = _get_season_statcast(season)
+        if sc.empty:
+            return default
+
+        sc = sc.copy()
+        if "game_date" not in sc.columns:
+            return default
+
+        sc["game_date"] = pd.to_datetime(sc["game_date"], errors="coerce")
+        target_dt = pd.to_datetime(date, errors="coerce")
+        if pd.isna(target_dt):
+            return default
+
+        cutoff = target_dt - pd.Timedelta(days=3)
+
+        # Identify pitcher team
+        if "inning_topbot" not in sc.columns or "home_team" not in sc.columns:
+            return default
+
+        sc["pitcher_team"] = np.where(
+            sc["inning_topbot"] == "Bot",
+            sc["away_team"],   # Bottom inning: away team pitches, home team bats
+            sc["home_team"],   # Top inning: home team pitches, away team bats
+        )
+
+        # Filter: team, last 3 days, relief pitchers (not inning 1)
+        mask = (
+            (sc["pitcher_team"] == team)
+            & (sc["game_date"] >= cutoff)
+            & (sc["game_date"] < target_dt)
+        )
+        if "inning" in sc.columns:
+            mask = mask & (sc["inning"] > 1)
+
+        recent = sc[mask]
+        if recent.empty:
+            return {**default, "bullpen_fatigue_score": 0.2}
+
+        # Estimate outs per pitch via events
+        bullpen_pitches = len(recent)
+        _OUTS_MAP = {
+            "strikeout": 1, "field_out": 1, "force_out": 1, "sac_fly": 1,
+            "sac_bunt": 1, "fielders_choice_out": 1, "other_out": 1,
+            "grounded_into_double_play": 2, "double_play": 2,
+            "strikeout_double_play": 2, "sac_fly_double_play": 2,
+            "triple_play": 3,
+        }
+        if "events" in recent.columns:
+            outs_recorded = recent["events"].map(_OUTS_MAP).fillna(0).sum()
+        else:
+            outs_recorded = bullpen_pitches * 0.33  # rough proxy
+
+        bullpen_ip = float(outs_recorded) / 3.0
+
+        # Normalize: ~100 pitches/day is average bullpen usage; scale 0-1
+        # A team that threw 300 pitches in 3 days would score ~1.0
+        fatigue = min(1.0, bullpen_pitches / 300.0)
+
+        return {
+            "bullpen_pitches_last_3d": int(bullpen_pitches),
+            "bullpen_ip_last_3d": round(bullpen_ip, 1),
+            "bullpen_fatigue_score": round(fatigue, 3),
+        }
+    except Exception as exc:
+        print(f"[WARN] Could not compute bullpen usage for {team}: {exc}")
+        return default

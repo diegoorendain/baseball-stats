@@ -8,7 +8,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from config import PARK_FACTORS, TEAM_ABBREV_MAP
+from config import PARK_FACTORS, TEAM_ABBREV_MAP, UMPIRE_K_ADJUSTMENTS, INDOOR_STADIUMS
 
 
 # ---------------------------------------------------------------------------
@@ -358,6 +358,10 @@ def build_today_game_features(
     today_games: list[dict[str, Any]],
     game_logs: dict[str, pd.DataFrame],
     pitching_stats: pd.DataFrame,
+    umpire_data: dict[str, Any] | None = None,
+    weather_data: dict[str, dict[str, Any]] | None = None,
+    schedule_context: dict[str, dict[str, Any]] | None = None,
+    bullpen_data: dict[str, dict[str, Any]] | None = None,
 ) -> pd.DataFrame:
     """Build features for today's games for Total Runs + Game Winner models.
 
@@ -369,6 +373,18 @@ def build_today_game_features(
         Historical game logs keyed by team abbreviation.
     pitching_stats:
         Recent pitching stats DataFrame.
+    umpire_data:
+        Optional dict mapping game_id → umpire info
+        (from ``load_umpire_data``).
+    weather_data:
+        Optional dict mapping team_abbrev → weather dict
+        (from ``load_weather_data``).
+    schedule_context:
+        Optional dict mapping team_abbrev → schedule context dict
+        (from ``load_team_schedule_context``).
+    bullpen_data:
+        Optional dict mapping team_abbrev → bullpen usage dict
+        (from ``load_bullpen_usage``).
 
     Returns
     -------
@@ -473,8 +489,52 @@ def build_today_game_features(
         away_sp_feat = _pitcher_features(game.get("away_probable_pitcher", ""), "away_sp")
         home_sp_feat = _pitcher_features(game.get("home_probable_pitcher", ""), "home_sp")
 
+        # ---- New context features ----
+        game_id = game.get("game_id")
+
+        # Umpire K-rate adjustment
+        umpire_k_adj = 0.0
+        if umpire_data and game_id is not None:
+            ump_info = umpire_data.get(str(game_id), umpire_data.get(game_id, {}))
+            ump_name = ump_info.get("home_plate_umpire", "") if isinstance(ump_info, dict) else ""
+            umpire_k_adj = _safe_get(UMPIRE_K_ADJUSTMENTS, ump_name, 0.0)
+
+        # Weather
+        weather_temp = 70.0
+        weather_wind_speed = 5.0
+        weather_is_outdoor = 0 if home_abbrev in INDOOR_STADIUMS else 1
+        if weather_data:
+            wd = weather_data.get(home_abbrev, {})
+            weather_temp = float(wd.get("temp_f", 70.0))
+            weather_wind_speed = float(wd.get("wind_speed_mph", 5.0))
+            weather_is_outdoor = int(wd.get("is_outdoor", weather_is_outdoor))
+
+        # Rest days / schedule context
+        home_rest_days = 1
+        home_games_last_7 = 5
+        home_travel_flag = 0
+        away_rest_days = 1
+        away_games_last_7 = 5
+        away_travel_flag = 0
+        if schedule_context:
+            hctx = schedule_context.get(home_abbrev, {})
+            home_rest_days = int(hctx.get("rest_days", 1))
+            home_games_last_7 = int(hctx.get("games_last_7", 5))
+            home_travel_flag = int(hctx.get("travel_flag", 0))
+            actx = schedule_context.get(away_abbrev, {})
+            away_rest_days = int(actx.get("rest_days", 1))
+            away_games_last_7 = int(actx.get("games_last_7", 5))
+            away_travel_flag = int(actx.get("travel_flag", 0))
+
+        # Bullpen fatigue
+        home_bullpen_fatigue = 0.5
+        away_bullpen_fatigue = 0.5
+        if bullpen_data:
+            home_bullpen_fatigue = float(bullpen_data.get(home_abbrev, {}).get("bullpen_fatigue_score", 0.5))
+            away_bullpen_fatigue = float(bullpen_data.get(away_abbrev, {}).get("bullpen_fatigue_score", 0.5))
+
         row: dict[str, Any] = {
-            "game_id": game.get("game_id"),
+            "game_id": game_id,
             "date": game.get("date"),
             "away_team": away_name,
             "home_team": home_name,
@@ -486,6 +546,19 @@ def build_today_game_features(
             "park_factor_runs": _park_factor(home_abbrev, "runs"),
             "park_factor_hr": _park_factor(home_abbrev, "hr"),
             "park_factor_hits": _park_factor(home_abbrev, "hits"),
+            # New features
+            "umpire_k_adj": umpire_k_adj,
+            "weather_temp": weather_temp,
+            "weather_wind_speed": weather_wind_speed,
+            "weather_is_outdoor": weather_is_outdoor,
+            "home_rest_days": home_rest_days,
+            "away_rest_days": away_rest_days,
+            "home_games_last_7": home_games_last_7,
+            "away_games_last_7": away_games_last_7,
+            "home_travel_flag": home_travel_flag,
+            "away_travel_flag": away_travel_flag,
+            "home_bullpen_fatigue": home_bullpen_fatigue,
+            "away_bullpen_fatigue": away_bullpen_fatigue,
         }
         row.update(away_feat)
         row.update(home_feat)
@@ -507,6 +580,7 @@ def build_today_batter_features(
     opp_pitcher_stats: dict[str, Any] | None = None,
     park_factor_hr: float = 1.0,
     park_factor_hits: float = 1.0,
+    umpire_k_adj: float = 0.0,
 ) -> pd.DataFrame:
     """Build features for today's batters.
 
@@ -524,6 +598,8 @@ def build_today_batter_features(
         Home run park factor for today's venue.
     park_factor_hits:
         Hits park factor for today's venue.
+    umpire_k_adj:
+        K-rate adjustment for today's home plate umpire.
 
     Returns
     -------
@@ -584,6 +660,15 @@ def build_today_batter_features(
                     bb_rate = bb / max(pa, 1)
                     hr_per_game = hr / max(g, 1)
                     hits_per_game = hits / max(g, 1)
+                    # Use pre-computed Statcast metrics if present
+                    if "barrel_rate" in p.index and pd.notna(p.get("barrel_rate")):
+                        barrel_rate = float(p["barrel_rate"])
+                    if "avg_exit_velo" in p.index and pd.notna(p.get("avg_exit_velo")):
+                        avg_exit_velo = float(p["avg_exit_velo"])
+                    if "avg_launch_angle" in p.index and pd.notna(p.get("avg_launch_angle")):
+                        avg_launch_angle = float(p["avg_launch_angle"])
+                    if "hard_hit_rate" in p.index and pd.notna(p.get("hard_hit_rate")):
+                        hard_hit_rate = float(p["hard_hit_rate"])
 
         if statcast is not None and not statcast.empty:
             sc = statcast.copy()
@@ -596,9 +681,36 @@ def build_today_batter_features(
             if "barrel" in sc.columns:
                 barrel_rate = float((sc["barrel"] == 1).mean() or 0.07)
 
-        # Platoon advantage: LHB vs RHP → advantage
+        # Platoon advantage (more granular: +1=advantage, 0=neutral, -1=disadvantage)
         opp_hand = str(opp.get("hand", "R"))
         platoon = 1.0 if (hand == "L" and opp_hand == "R") or (hand == "R" and opp_hand == "L") else 0.0
+        # platoon_split_factor: approximate differential effect (same handedness = disadvantage)
+        platoon_split_factor = 1.05 if platoon == 1.0 else (0.95 if hand == opp_hand else 1.0)
+
+        # xwOBA approximation from barrel_rate, hard_hit_rate, exit_velo.
+        # Weights are approximations based on public Statcast research (Baseball Savant).
+        # Barrel rate is weighted most heavily as it correlates ~0.7 with xwOBA in
+        # published studies (Chamberlain/Slowinski FanGraphs methodology).
+        xwoba = max(0.0, min(0.600,
+            0.220                           # intercept (near league-avg .320 wOBA)
+            + barrel_rate * 1.40            # barrel rate is strongest predictor
+            + hard_hit_rate * 0.35
+            + (avg_exit_velo - 88.0) * 0.008
+        ))
+
+        # xBA approximation from exit_velo + launch_angle distribution
+        # Optimal LA range ~10-30°, EV > 95 most impactful
+        la_bonus = max(0.0, 1.0 - abs(avg_launch_angle - 20.0) / 25.0)
+        xba = max(0.100, min(0.400,
+            0.150
+            + (avg_exit_velo - 88.0) * 0.006
+            + la_bonus * 0.08
+            + hard_hit_rate * 0.10
+        ))
+
+        # Hot/cold streak: if batter dict carries recent game data use it,
+        # otherwise default to neutral (1.0)
+        hot_cold_streak = float(batter.get("hot_cold_streak", 1.0))
 
         row: dict[str, Any] = {
             "player_name": name,
@@ -625,6 +737,12 @@ def build_today_batter_features(
             # Context
             "park_factor_hr": park_factor_hr,
             "park_factor_hits": park_factor_hits,
+            # New advanced features
+            "xwoba": round(xwoba, 4),
+            "xba": round(xba, 4),
+            "platoon_split_factor": round(platoon_split_factor, 4),
+            "hot_cold_streak": round(hot_cold_streak, 4),
+            "umpire_k_adj": umpire_k_adj,
         }
         rows.append(row)
 
@@ -644,6 +762,7 @@ def build_today_pitcher_features(
     statcast: pd.DataFrame | None = None,
     opp_team_batting: dict[str, Any] | None = None,
     rest_days: int = 5,
+    umpire_k_adj: float = 0.0,
 ) -> pd.DataFrame:
     """Build features for today's starting pitchers.
 
@@ -659,6 +778,8 @@ def build_today_pitcher_features(
         Dict of opposing team batting stats (k_rate, ops).
     rest_days:
         Days since last start.
+    umpire_k_adj:
+        K-rate adjustment for today's home plate umpire.
 
     Returns
     -------
@@ -689,6 +810,8 @@ def build_today_pitcher_features(
         whiff_rate = 0.25
         chase_rate = 0.28
         avg_fastball_velo = 93.0
+        pitch_mix_entropy = 1.5  # moderate diversity by default
+        recent_velo_trend = 0.0  # 0 = neutral
 
         if not ps.empty:
             name_col = next(
@@ -710,6 +833,12 @@ def build_today_pitcher_features(
                     k_rate = so / max(so + bb + h, 1)
                     k_per_game = so / max(gs, 1)
                     ip_per_start = ip / max(gs, 1)
+                    if "whiff_rate" in p.index and pd.notna(p.get("whiff_rate")):
+                        whiff_rate = float(p["whiff_rate"])
+                    if "chase_rate" in p.index and pd.notna(p.get("chase_rate")):
+                        chase_rate = float(p["chase_rate"])
+                    if "avg_fastball_velo" in p.index and pd.notna(p.get("avg_fastball_velo")):
+                        avg_fastball_velo = float(p["avg_fastball_velo"])
 
         if statcast is not None and not statcast.empty:
             sc = statcast.copy()
@@ -721,6 +850,14 @@ def build_today_pitcher_features(
                 whiffs_sc = sc[sc["description"].str.contains("swinging_strike", case=False, na=False)]
                 if len(swings) > 0:
                     whiff_rate = len(whiffs_sc) / len(swings)
+            # Pitch mix entropy (Shannon entropy over pitch types)
+            if "pitch_type" in sc.columns:
+                try:
+                    counts = sc["pitch_type"].dropna().value_counts(normalize=True)
+                    if not counts.empty:
+                        pitch_mix_entropy = float(-np.sum(counts * np.log2(counts + 1e-10)))
+                except (ValueError, TypeError) as exc:
+                    print(f"[WARN] Could not compute pitch_mix_entropy for {name}: {exc}")
 
         row: dict[str, Any] = {
             "player_name": name,
@@ -739,6 +876,10 @@ def build_today_pitcher_features(
             "opp_team_ops": float(opp.get("ops", 0.720)),
             "rest_days": float(rest_days),
             "pitcher_hand": 1.0 if hand == "R" else 0.0,
+            # New advanced features
+            "umpire_k_adj": umpire_k_adj,
+            "pitch_mix_entropy": round(pitch_mix_entropy, 4),
+            "recent_velo_trend": round(recent_velo_trend, 4),
         }
         rows.append(row)
 
