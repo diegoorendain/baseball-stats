@@ -195,6 +195,17 @@ def build_batter_features(
         avg_launch_angle = 12.0
         hard_hit_rate = 0.35
 
+        # Use pre-computed statcast metrics from the stats DataFrame when available
+        # (populated by load_batting_stats when data comes from Statcast aggregation)
+        if "barrel_rate" in player.index and pd.notna(player.get("barrel_rate")):
+            barrel_rate = float(player["barrel_rate"])
+        if "avg_exit_velo" in player.index and pd.notna(player.get("avg_exit_velo")):
+            avg_exit_velo = float(player["avg_exit_velo"])
+        if "avg_launch_angle" in player.index and pd.notna(player.get("avg_launch_angle")):
+            avg_launch_angle = float(player["avg_launch_angle"])
+        if "hard_hit_rate" in player.index and pd.notna(player.get("hard_hit_rate")):
+            hard_hit_rate = float(player["hard_hit_rate"])
+
         if statcast is not None and not statcast.empty:
             sc = statcast.copy()
             sc.columns = [c.lower() for c in sc.columns]
@@ -289,6 +300,15 @@ def build_pitcher_features(
         chase_rate = 0.28
         avg_fastball_velo = 93.0
 
+        # Use pre-computed statcast metrics from the stats DataFrame when available
+        # (populated by load_pitching_stats when data comes from Statcast aggregation)
+        if "whiff_rate" in p.index and pd.notna(p.get("whiff_rate")):
+            whiff_rate = float(p["whiff_rate"])
+        if "chase_rate" in p.index and pd.notna(p.get("chase_rate")):
+            chase_rate = float(p["chase_rate"])
+        if "avg_fastball_velo" in p.index and pd.notna(p.get("avg_fastball_velo")):
+            avg_fastball_velo = float(p["avg_fastball_velo"])
+
         if statcast is not None and not statcast.empty:
             sc = statcast.copy()
             sc.columns = [c.lower() for c in sc.columns]
@@ -317,7 +337,7 @@ def build_pitcher_features(
             "chase_rate": chase_rate,
             "avg_fastball_velo": avg_fastball_velo,
             "bb_per_9": bb / max(ip, 1) * 9,
-            "hand": str(p.get("throws", p.get("hand", p.get("p", "R"))) or "R"),
+            "hand": str(p.get("throws", p.get("p_throws", p.get("hand", p.get("p", "R")))) or "R"),
             "gs": gs,
             "so_season": so,
             "ip_season": ip,
